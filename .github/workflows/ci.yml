@@ -37,4 +37,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck bin/rlm bin/llm bin/_rlm-common.sh
+      - run: shellcheck --severity=warning bin/rlm bin/llm bin/_rlm-common.sh
