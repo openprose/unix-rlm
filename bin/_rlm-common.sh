@@ -1,4 +1,5 @@
 # _rlm-common.sh — Shared code for bin/rlm and bin/llm
+# shellcheck shell=bash
 # Sourced by both scripts. Do NOT add set -euo pipefail or a shebang here.
 
 # --- API Key -----------------------------------------------------------------

@@ -417,7 +417,14 @@ truncate_output() {
 		return 0
 	fi
 
-	local size_display="${byte_count}B"
+	local size_display
+	if [ "$byte_count" -ge 1048576 ]; then
+		size_display="$((byte_count / 1048576))MB"
+	elif [ "$byte_count" -ge 1024 ]; then
+		size_display="$((byte_count / 1024))KB"
+	else
+		size_display="${byte_count}B"
+	fi
 
 	local head_lines
 	head_lines=$(printf '%s' "$full_output" | head -n "$_RLM_TRUNCATE_HEAD")
