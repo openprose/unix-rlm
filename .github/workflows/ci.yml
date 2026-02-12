@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  bats:
+    name: BATS unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mig4/setup-bats@v1
+        with:
+          bats-version: 1.11.0
+      - run: bats test/*.bats
+
+  typecheck:
+    name: TypeScript typecheck (eval)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: eval/package-lock.json
+      - run: npm ci
+        working-directory: eval
+      - run: npx tsc --noEmit
+        working-directory: eval
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck bin/rlm bin/llm bin/_rlm-common.sh
