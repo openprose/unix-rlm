@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================================
+# llm — One-shot LLM call. No REPL, no iteration, no code execution.
+# ============================================================================
+#
+# Usage: llm "query"
+#        echo "data" | llm "query"
+#
+# Costs exactly 1 API call. Prefer over `rlm` for simple tasks:
+# classify an item, extract a value, answer a factual question.
+#
+# Environment variables:
+#   RLM_LLM_SYSTEM_PROMPT — Override the default system prompt
+#   RLM_MODEL             — OpenRouter model identifier
+#   RLM_MAX_TOKENS        — Max tokens per LLM response
+#   OPENROUTER_API_KEY    — OpenRouter API key
+# ============================================================================
+
+RLM_MAX_TOKENS="${RLM_MAX_TOKENS:-16384}"
+RLM_MODEL="${RLM_MODEL:-anthropic/claude-sonnet-4}"
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_rlm-common.sh"
+
+FLAT_SYSTEM_PROMPT='You are a helpful assistant answering a question.
+
+Answer the question directly and concisely. Give only the answer itself
+with no explanation, preamble, or formatting.
+
+If context is provided, use it to inform your answer.'
+
+SYSTEM_PROMPT="${RLM_LLM_SYSTEM_PROMPT:-$FLAT_SYSTEM_PROMPT}"
+
+if [ $# -lt 1 ]; then
+	echo "Usage: llm \"query\"" >&2
+	exit 1
+fi
+
+query="$1"
+
+if [ ! -t 0 ]; then
+	context_data="$(cat)"
+	if [ -n "$context_data" ]; then
+		user_msg="${query}
+
+Context: ${context_data}"
+	else
+		user_msg="$query"
+	fi
+else
+	user_msg="$query"
+fi
+
+messages="[{\"role\":\"user\",\"content\":$(printf '%s' "$user_msg" | jq -Rs .)}]"
+
+response=$(printf '%s' "$messages" | call_llm 1 "$SYSTEM_PROMPT") || {
+	echo "llm: LLM call failed" >&2
+	exit 1
+}
+
+printf '%s\n' "$response"

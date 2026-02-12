@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================================
+# rlm — Unix RLM: an RLM whose sandbox is a full Linux filesystem
+# ============================================================================
+#
+# Usage: rlm "query"
+#        echo "data" | rlm "query"
+#
+# Environment variables (configuration):
+#   OPENROUTER_API_KEY   — OpenRouter API key (or read from /etc/rlm/api-key)
+#   RLM_MODEL            — OpenRouter model identifier
+#   RLM_MAX_ITERATIONS   — Max loop iterations per invocation
+#   RLM_MAX_DEPTH        — Max recursion depth
+#   RLM_MAX_TOKENS       — Max tokens per LLM response
+#   RLM_PLUGINS          — Comma-separated plugin names to load
+#   RLM_PLUGINS_DIR      — Directory containing plugin .md files
+#   RLM_CHILD_SYSTEM_PROMPT — Custom system prompt for this child (set by parent)
+#
+# Internal environment (set by rlm, visible to children):
+#   RLM_WORKDIR          — This invocation's working directory
+#   RLM_ANSWER_FILE      — Path where RETURN writes the answer
+#   RLM_INPUT            — Path to piped stdin data (if any)
+#   RLM_DEPTH            — Current recursion depth
+#   RLM_INVOCATION_ID    — Unique ID for this invocation
+#   RLM_PARENT_ID        — Parent's invocation ID
+#   RLM_ROOT_QUERY       — The root task (truncated to 200 chars)
+#   RLM_LINEAGE          — Colon-separated query trail
+#   RLM_EFFECTIVE_MAX_ITERS — Iteration budget for this depth
+# ============================================================================
+
+RLM_MAX_ITERATIONS="${RLM_MAX_ITERATIONS:-15}"
+RLM_MAX_DEPTH="${RLM_MAX_DEPTH:-3}"
+RLM_MAX_TOKENS="${RLM_MAX_TOKENS:-16384}"
+RLM_MODEL="${RLM_MODEL:-anthropic/claude-sonnet-4}"
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_rlm-common.sh"
+
+SYSTEM_PROMPT='IMPORTANT: Do NOT use function calling or tool use. Respond ONLY with plain text containing ```repl code blocks.
+
+You solve tasks by writing and executing code in a persistent Linux environment.
+
+Write code in ```repl fenced blocks. Every response MUST contain at least one ```repl block. Code outside ```repl fences is not executed.
+
+When you have your final answer, call RETURN "value" inside a ```repl block. RETURN is the ONLY way to deliver your answer. Do not simply state the answer in prose.
+
+## Delegation
+
+- `llm "query"` — a single call to a language model. Fast, cheap, one-shot.
+  No REPL, no code execution. Costs 1 API call. Prefer for simple tasks:
+  classify an item, extract a value, answer a factual question.
+  Pipe data with: echo "data" | llm "query"
+
+- `rlm "query"` — recursive call to another RLM with its own REPL loop,
+  iteration budget, and code execution. Powerful but expensive (3-15 API
+  calls). Use for complex subtasks that need iteration.
+  Pipe data with: echo "data" | rlm "query"
+  Pass a custom system prompt with: RLM_CHILD_SYSTEM_PROMPT="..." rlm "query"
+
+The filesystem is shared across all rlm calls. /context/ is for data you
+intend to share across the recursion tree. Write working files to your own
+directory; avoid concurrent writes to the same path.
+
+## Designing Delegation
+
+Prefer `llm` over `rlm` when the subtask is simple. Each `rlm` call
+multiplies API cost by 3-15x. Use `rlm` only when the child needs to
+write code, iterate, or delegate further.
+
+You have bash, python3, jq, curl, git, and all standard Unix tools. You can install more with apt or pip.
+
+Files persist across code blocks and across turns, but variables do not — each code block runs in a fresh shell. Use the filesystem for intermediate state.
+
+If input was piped to this invocation, it is saved at $RLM_INPUT. Process it programmatically — it may be larger than your context window.'
+
+if [ $# -lt 1 ]; then
+	echo "Usage: rlm \"query\"" >&2
+	exit 1
+fi
+
+query="$1"
+
+emit_metadata() {
+	# Emit structured metadata to stderr for eval harness/drivers to parse.
+	# Suppressed in mock/test mode to avoid polluting test output.
+	[ -n "${_RLM_MOCK_DIR:-}" ] && return 0
+	local iters="${1:-0}"
+	local wdir="${2:-${RLM_WORKDIR:-}}"
+	echo "rlm-meta: {\"iterations\":$iters,\"workdir\":\"$wdir\"}" >&2
+}
+
+RLM_DEPTH="${RLM_DEPTH:-0}"
+
+BASE_SYSTEM_PROMPT='You are a helpful assistant. Answer the question directly and concisely.'
+
+if [ "$RLM_DEPTH" -ge "$RLM_MAX_DEPTH" ]; then
+	# Base case: single LLM call, no loop, no code execution.
+	# Uses the simpler BASE_SYSTEM_PROMPT (no mention of RETURN, code blocks, or sandbox).
+	if [ -n "${_RLM_MOCK_DIR:-}" ]; then
+		# In mock mode, read from base.md if it exists, otherwise diagnostic only
+		base_file="$_RLM_MOCK_DIR/base.md"
+		if [ -f "$base_file" ]; then
+			printf '%s\n' "$(cat "$base_file")"
+		fi
+		echo "rlm: base case (depth $RLM_DEPTH >= max $RLM_MAX_DEPTH)" >&2
+		emit_metadata 1 ""
+		exit 0
+	fi
+	base_messages="[{\"role\":\"user\",\"content\":$(printf '%s' "$query" | jq -Rs .)}]"
+	base_response=$(printf '%s' "$base_messages" | call_llm 1 "$BASE_SYSTEM_PROMPT") || {
+		echo "rlm: base case LLM call failed" >&2
+		emit_metadata 1 ""
+		exit 1
+	}
+	printf '%s\n' "$base_response"
+	emit_metadata 1 ""
+	exit 0
+fi
+
+_SELF_DEPTH="$RLM_DEPTH"
+
+# Capture and clear parent's custom system prompt (single-hop: parent->child only).
+_CHILD_SYSTEM_PROMPT="${RLM_CHILD_SYSTEM_PROMPT:-}"
+unset RLM_CHILD_SYSTEM_PROMPT
+
+export RLM_DEPTH=$((RLM_DEPTH + 1))
+
+_RLM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case ":$PATH:" in
+	*":$_RLM_SCRIPT_DIR:"*) ;;  # already on PATH
+	*) export PATH="$_RLM_SCRIPT_DIR:$PATH" ;;
+esac
+
+if [ "$_SELF_DEPTH" -eq 0 ]; then
+	export RLM_INVOCATION_ID="root"
+	export RLM_PARENT_ID=""
+	export RLM_ROOT_QUERY="${query:0:200}"
+	export RLM_LINEAGE="$query"
+else
+	export RLM_INVOCATION_ID="d${_SELF_DEPTH}-c$$"
+	export RLM_PARENT_ID="${RLM_PARENT_ID:-root}"
+	export RLM_ROOT_QUERY="${RLM_ROOT_QUERY:-${query:0:200}}"
+	export RLM_LINEAGE="${RLM_LINEAGE:+${RLM_LINEAGE}:}${query}"
+fi
+
+compute_iteration_budget() {
+	local depth="$1"
+	local max_iters="$2"
+	case "$depth" in
+		0) echo "$max_iters" ;;
+		1) echo $(( max_iters < 7 ? max_iters : 7 )) ;;
+		2) echo $(( max_iters < 4 ? max_iters : 4 )) ;;
+		*) echo $(( max_iters < 3 ? max_iters : 3 )) ;;
+	esac
+}
+
+RLM_EFFECTIVE_MAX_ITERS=$(compute_iteration_budget "$_SELF_DEPTH" "$RLM_MAX_ITERATIONS")
+export RLM_EFFECTIVE_MAX_ITERS
+
+if [ -n "$_CHILD_SYSTEM_PROMPT" ]; then
+	# Parent provided custom instructions. Build a child-specific prompt:
+	# custom instructions + minimal environment docs + orientation block.
+	CHILD_REPL_SECTION='
+
+## Environment
+
+- Code runs in ```repl fenced blocks (bash). Each block executes in a fresh shell.
+- RETURN "value" — return your final answer.
+- llm "query" — one-shot LLM call for simple subtasks.
+- rlm "query" — delegate to a child RLM (only if you need iteration/code execution).
+- Files persist across iterations. Use the filesystem for state.
+- If input was piped, it is at $RLM_INPUT.
+
+Write exactly one ```repl block per response.'
+
+	SYSTEM_PROMPT="${_CHILD_SYSTEM_PROMPT}${CHILD_REPL_SECTION}"
+fi
+
+load_plugins() {
+	local IFS=','
+	local plugin_bodies=""
+	for name in $1; do
+		local file="${RLM_PLUGINS_DIR:-$_RLM_SCRIPT_DIR/../plugins}/${name}.md"
+		if [[ ! -f "$file" ]]; then
+			echo "rlm: warning: plugin '$name' not found at $file" >&2
+			continue
+		fi
+		local body
+		body=$(awk 'BEGIN{fm=0} /^---$/{if(fm<2){fm++;next}} fm>=2{print}' "$file")
+		if [[ -n "$plugin_bodies" ]]; then
+			plugin_bodies="${plugin_bodies}
+
+---
+
+${body}"
+		else
+			plugin_bodies="$body"
+		fi
+	done
+	echo "$plugin_bodies"
+}
+
+if [[ -n "${RLM_PLUGINS:-}" ]]; then
+	plugin_text=$(load_plugins "$RLM_PLUGINS")
+	if [[ -n "$plugin_text" ]]; then
+		SYSTEM_PROMPT="${SYSTEM_PROMPT}
+
+---
+
+${plugin_text}"
+	fi
+fi
+
+_RLM_TREE_ROOT="${_RLM_TREE_ROOT:-/rlm/tree}"  # testing seam
+
+if [ -n "${_RLM_RESUME_DIR:-}" ]; then
+	RLM_WORKDIR="$_RLM_RESUME_DIR"
+else
+	PARENT_WORKDIR="${RLM_WORKDIR:-}"
+	if [ -z "$PARENT_WORKDIR" ]; then
+		RLM_WORKDIR="${_RLM_TREE_ROOT}/$$"
+	else
+		RLM_WORKDIR="${PARENT_WORKDIR}/children/$$"
+	fi
+fi
+mkdir -p "$RLM_WORKDIR/trace" "$RLM_WORKDIR/children"
+export RLM_WORKDIR
+
+# When resuming from an existing workdir, compute the starting iteration from
+# the number of existing trace response files.
+_start_iteration=1
+if [ -n "${_RLM_RESUME_DIR:-}" ]; then
+	_existing_responses=$(ls -1 "$RLM_WORKDIR/trace/"*-response.md 2>/dev/null | wc -l | tr -d ' ')
+	_start_iteration=$((_existing_responses + 1))
+fi
+
+RLM_ANSWER_FILE="$RLM_WORKDIR/answer"
+export RLM_ANSWER_FILE
+
+printf '%s' "$query" > "$RLM_WORKDIR/query"
+
+if [ ! -t 0 ]; then
+	cat > "$RLM_WORKDIR/input"
+	if [ -s "$RLM_WORKDIR/input" ]; then
+		export RLM_INPUT="$RLM_WORKDIR/input"
+	else
+		rm -f "$RLM_WORKDIR/input"
+	fi
+fi
+
+if [ -n "${RLM_INPUT:-}" ]; then
+	input_size=$(wc -c < "$RLM_INPUT" | tr -d ' ')
+	SYSTEM_PROMPT="${SYSTEM_PROMPT}
+
+CRITICAL: Input data (${input_size} bytes) has been piped to this invocation and saved at \$RLM_INPUT. You MUST read this file to answer the question. Do not answer from memory — the answer is in the input data."
+fi
+
+build_orientation() {
+	local self_depth="$1"
+	local max_depth="$2"
+	local effective_iters="$3"
+	local invocation_id="$4"
+	local parent_id="$5"
+	local root_query="$6"
+	local max_depth_0=$((max_depth - 1))
+
+	echo ""
+	echo "## Your Position"
+	echo ""
+
+	if [ "$self_depth" -eq 0 ]; then
+		echo "Agent \"${invocation_id}\" — depth ${self_depth} of ${max_depth_0} (0-indexed)."
+		echo "You are the root orchestrator."
+	else
+		echo "Agent \"${invocation_id}\" — depth ${self_depth} of ${max_depth_0} (0-indexed)."
+		echo "Parent: \"${parent_id}\". Root task: \"${root_query}\""
+	fi
+
+	echo "Iteration budget: ${effective_iters} iterations."
+
+	if [ "$self_depth" -ge $((max_depth - 1)) ]; then
+		echo "Your rlm children will run in FLAT MODE (one-shot, no REPL, no sandbox). Pass all data directly in the query."
+	elif [ "$self_depth" -ge $((max_depth - 2)) ]; then
+		echo "Your children will be REPL agents at depth $((self_depth + 1))."
+		echo ""
+		echo "IMPORTANT: Your children are at the deepest REPL level."
+		echo "Any rlm calls THEY make will be flat/one-shot (no code, no iteration)."
+		echo "Design child tasks to be self-contained."
+	else
+		echo "Your children will be REPL agents at depth $((self_depth + 1))."
+	fi
+}
+
+orientation_text=$(build_orientation "$_SELF_DEPTH" "$RLM_MAX_DEPTH" \
+	"$RLM_EFFECTIVE_MAX_ITERS" "$RLM_INVOCATION_ID" "${RLM_PARENT_ID:-}" \
+	"${RLM_ROOT_QUERY:-}")
+
+SYSTEM_PROMPT="${SYSTEM_PROMPT}
+
+${orientation_text}"
+
+# --- Functions ---------------------------------------------------------------
+
+extract_code_blocks() {
+	# Parse ```repl blocks from stdin, write each to a numbered .sh file, print the dir.
+	local blocks_dir
+	blocks_dir="$(mktemp -d)"
+
+	local return_fn
+	return_fn='RETURN() {
+    printf '\''%s'\'' "$1" > "$RLM_ANSWER_FILE"
+}'
+
+	local in_repl_block=false
+	local block_num=0
+	local current_block=""
+
+	while IFS= read -r line || [ -n "$line" ]; do
+		if $in_repl_block; then
+			if [[ "$line" =~ ^'```'[[:space:]]*$ ]]; then
+				((block_num++))
+				printf '%s\n\n%s' "$return_fn" "$current_block" > "$blocks_dir/$block_num.sh"
+				in_repl_block=false
+				current_block=""
+			else
+				if [ -z "$current_block" ]; then
+					current_block="$line"
+				else
+					current_block="$current_block
+$line"
+				fi
+			fi
+		else
+			if [[ "$line" =~ ^'```repl'[[:space:]]*$ ]]; then
+				in_repl_block=true
+				current_block=""
+			fi
+		fi
+	done
+
+	echo "$blocks_dir"
+}
+
+execute_block() {
+	# Run a .sh block, write output to trace, print output to stdout.
+	local block_file="$1"
+	local iteration="${2:-1}"
+	local block_num="${3:-1}"
+
+	local output=""
+	local exit_code=0
+	output="$(cd "$RLM_WORKDIR" && bash "$block_file" 2>&1)" || exit_code=$?
+
+	if [ "$exit_code" -ne 0 ]; then
+		output="[Exit code: $exit_code]
+$output"
+	fi
+
+	local padded
+	padded=$(printf '%03d' "$iteration")
+	printf '%s' "$output" > "$RLM_WORKDIR/trace/${padded}-output.txt"
+
+	printf '%s' "$output"
+}
+
+truncate_output() {
+	# Produce a head+tail truncated version of output for the LLM message.
+	local full_output="$1"
+	local trace_path="$2"
+
+	local _RLM_TRUNCATE_MAX_BYTES="${_RLM_TRUNCATE_MAX_BYTES:-51200}"
+	local _RLM_TRUNCATE_MAX_LINES="${_RLM_TRUNCATE_MAX_LINES:-1000}"
+	local _RLM_TRUNCATE_HEAD="${_RLM_TRUNCATE_HEAD:-50}"
+	local _RLM_TRUNCATE_TAIL="${_RLM_TRUNCATE_TAIL:-20}"
+
+	local byte_count
+	byte_count=$(printf '%s' "$full_output" | wc -c | tr -d ' ')
+	local line_count
+	line_count=$(printf '%s' "$full_output" | wc -l | tr -d ' ')
+
+	if [ "$byte_count" -le "$_RLM_TRUNCATE_MAX_BYTES" ] && [ "$line_count" -le "$_RLM_TRUNCATE_MAX_LINES" ]; then
+		printf '%s' "$full_output"
+		return 0
+	fi
+
+	local size_display="${byte_count}B"
+
+	local head_lines
+	head_lines=$(printf '%s' "$full_output" | head -n "$_RLM_TRUNCATE_HEAD")
+	local tail_lines
+	tail_lines=$(printf '%s' "$full_output" | tail -n "$_RLM_TRUNCATE_TAIL")
+
+	printf '[Output truncated. Full output: %s (%s, %s lines)]\nFirst %d lines:\n%s\nLast %d lines:\n%s' \
+		"$trace_path" "$size_display" "$line_count" \
+		"$_RLM_TRUNCATE_HEAD" "$head_lines" \
+		"$_RLM_TRUNCATE_TAIL" "$tail_lines"
+}
+
+build_messages() {
+	# Reconstruct the conversation JSON from query + trace files.
+	local messages
+	messages="[{\"role\":\"user\",\"content\":$(jq -Rs . "$RLM_WORKDIR/query")}]"
+
+	for resp in "$RLM_WORKDIR/trace/"*-response.md; do
+		[ -f "$resp" ] || break
+		local full_output_file="${resp/-response.md/-output.txt}"
+		local truncated_output_file="${resp/-response.md/-output-truncated.txt}"
+
+		local output_file="$full_output_file"
+		if [ -f "$truncated_output_file" ]; then
+			output_file="$truncated_output_file"
+		fi
+
+		if [ -f "$output_file" ]; then  # complete iteration
+			messages=$(echo "$messages" | jq \
+				--rawfile r "$resp" \
+				--rawfile o "$output_file" \
+				'. + [{"role":"assistant","content":$r},{"role":"user","content":$o}]')
+		fi
+	done
+
+	echo "$messages"
+}
+
+# --- Main Loop ---------------------------------------------------------------
+
+consecutive_no_code=0
+
+for ((iteration=_start_iteration; iteration<=RLM_EFFECTIVE_MAX_ITERS; iteration++)); do
+	messages=$(build_messages)
+
+	response=$(echo "$messages" | call_llm "$iteration") || {
+		echo "rlm: LLM call failed at iteration $iteration" >&2
+		emit_metadata "$iteration"
+		exit 1
+	}
+
+	padded=$(printf '%03d' "$iteration")
+	printf '%s' "$response" > "$RLM_WORKDIR/trace/${padded}-response.md"
+
+	blocks_dir=$(echo "$response" | extract_code_blocks)
+
+	if [ -z "$(ls -A "$blocks_dir" 2>/dev/null)" ]; then
+		((consecutive_no_code++)) || true
+
+		if [ "$consecutive_no_code" -ge 2 ]; then
+			echo "rlm: two consecutive responses with no code blocks" >&2
+			rm -rf "$blocks_dir"
+			emit_metadata "$iteration"
+			exit 1
+		fi
+
+		no_code_msg='Your response contained no executable code blocks. Wrap code in ```repl fences.'
+		printf '%s' "$no_code_msg" > "$RLM_WORKDIR/trace/${padded}-output.txt"
+		rm -rf "$blocks_dir"
+		continue
+	fi
+
+	consecutive_no_code=0
+	block_num=1
+	iteration_output=""
+	for block in "$blocks_dir"/*.sh; do
+		[ -f "$block" ] || break
+
+		output=$(execute_block "$block" "$iteration" "$block_num")
+
+		if [ -n "$iteration_output" ]; then
+			iteration_output="$iteration_output
+$output"
+		else
+			iteration_output="$output"
+		fi
+
+		if [ -f "$RLM_ANSWER_FILE" ]; then
+			answer=$(cat "$RLM_ANSWER_FILE")
+			printf '%s\n' "$answer"
+			rm -rf "$blocks_dir"
+			emit_metadata "$iteration"
+			exit 0
+		fi
+
+		((block_num++))
+	done
+
+	if [ -z "$iteration_output" ]; then
+		iteration_output="[No output. Your code ran successfully but produced no stdout/stderr. If you redirected to a file, read it back or use RETURN.]"
+	fi
+	printf '%s' "$iteration_output" > "$RLM_WORKDIR/trace/${padded}-output.txt"
+
+	truncated=$(truncate_output "$iteration_output" "$RLM_WORKDIR/trace/${padded}-output.txt")
+	if [ "$truncated" != "$iteration_output" ]; then
+		printf '%s' "$truncated" > "$RLM_WORKDIR/trace/${padded}-output-truncated.txt"
+	fi
+
+	rm -rf "$blocks_dir"
+done
+
+# If we get here, we exhausted max iterations without RETURN
+echo "rlm: max iterations ($RLM_EFFECTIVE_MAX_ITERS) reached without RETURN" >&2
+emit_metadata "$RLM_EFFECTIVE_MAX_ITERS"
+exit 1

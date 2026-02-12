@@ -1,0 +1,21 @@
+{
+  "name": "unix-rlm-eval",
+  "version": "1.0.0",
+  "description": "Eval harness for Unix RLM",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "run": "tsx src/run.ts",
+    "analyze": "tsx src/analyze.ts"
+  },
+  "dependencies": {
+    "minimist": "^1.2.8",
+    "tsx": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/minimist": "^1.2.5",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
