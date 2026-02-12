@@ -14,7 +14,7 @@ set -euo pipefail
 
 PREFIX="${PREFIX:-/usr/local}"
 INSTALL_DIR="$PREFIX/bin"
-REPO_URL="https://raw.githubusercontent.com/openprose/unix-rlm/main/bin/rlm"
+REPO_BASE="https://raw.githubusercontent.com/openprose/unix-rlm/main/bin"
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -48,11 +48,11 @@ info "All dependencies satisfied."
 # If run from a cloned repo (bin/rlm exists relative to this script), copy
 # the local file. Otherwise, download from GitHub.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_RLM="$SCRIPT_DIR/bin/rlm"
+LOCAL_BIN="$SCRIPT_DIR/bin"
 
 # --- Install -----------------------------------------------------------------
 
-info "Installing rlm to $INSTALL_DIR/rlm..."
+info "Installing rlm, llm, and _rlm-common.sh to $INSTALL_DIR/..."
 
 # Create the install directory if it doesn't exist
 if [ ! -d "$INSTALL_DIR" ]; then
@@ -66,23 +66,37 @@ if [ ! -w "$INSTALL_DIR" ]; then
     error "Cannot write to $INSTALL_DIR. Try: sudo PREFIX=$PREFIX $0"
 fi
 
-if [ -f "$LOCAL_RLM" ]; then
+if [ -f "$LOCAL_BIN/rlm" ]; then
     # Install from local repo
-    cp "$LOCAL_RLM" "$INSTALL_DIR/rlm"
+    cp "$LOCAL_BIN/rlm" "$INSTALL_DIR/rlm"
+    cp "$LOCAL_BIN/llm" "$INSTALL_DIR/llm"
+    cp "$LOCAL_BIN/_rlm-common.sh" "$INSTALL_DIR/_rlm-common.sh"
 else
     # Download from GitHub
-    info "Downloading from $REPO_URL..."
-    curl -sSL "$REPO_URL" -o "$INSTALL_DIR/rlm" || {
+    info "Downloading from $REPO_BASE/..."
+    curl -sSL "$REPO_BASE/rlm" -o "$INSTALL_DIR/rlm" || {
         error "Failed to download rlm. Check your internet connection."
+    }
+    curl -sSL "$REPO_BASE/llm" -o "$INSTALL_DIR/llm" || {
+        error "Failed to download llm. Check your internet connection."
+    }
+    curl -sSL "$REPO_BASE/_rlm-common.sh" -o "$INSTALL_DIR/_rlm-common.sh" || {
+        error "Failed to download _rlm-common.sh. Check your internet connection."
     }
 fi
 
-chmod +x "$INSTALL_DIR/rlm"
+chmod +x "$INSTALL_DIR/rlm" "$INSTALL_DIR/llm"
 
 # --- Verify ------------------------------------------------------------------
 
 if [ ! -x "$INSTALL_DIR/rlm" ]; then
     error "Installation failed — $INSTALL_DIR/rlm is not executable."
+fi
+if [ ! -x "$INSTALL_DIR/llm" ]; then
+    error "Installation failed — $INSTALL_DIR/llm is not executable."
+fi
+if [ ! -f "$INSTALL_DIR/_rlm-common.sh" ]; then
+    error "Installation failed — $INSTALL_DIR/_rlm-common.sh is missing."
 fi
 
 # --- Success -----------------------------------------------------------------
@@ -90,7 +104,7 @@ fi
 echo ""
 echo "Unix RLM installed successfully!"
 echo ""
-info "Location: $INSTALL_DIR/rlm"
+info "Location: $INSTALL_DIR/{rlm,llm,_rlm-common.sh}"
 info ""
 info "Quick start:"
 info "  export OPENROUTER_API_KEY=\"sk-or-v1-...\""

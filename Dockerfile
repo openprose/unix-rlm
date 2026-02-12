@@ -15,8 +15,8 @@ RUN apt-get update && \
 # Create the rlm directory structure
 RUN mkdir -p /rlm/tree /context
 
-# Install rlm
-COPY bin/rlm /usr/local/bin/rlm
-RUN chmod +x /usr/local/bin/rlm
+# Install rlm, llm, and shared library
+COPY bin/rlm bin/llm bin/_rlm-common.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/rlm /usr/local/bin/llm
 
 ENTRYPOINT ["rlm"]

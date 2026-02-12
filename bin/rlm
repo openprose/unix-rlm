@@ -179,25 +179,58 @@ fi
 
 load_plugins() {
 	local IFS=','
-	local plugin_bodies=""
+	local driver_bodies=""
+	local app_bodies=""
+	local app_count=0
 	for name in $1; do
 		local file="${RLM_PLUGINS_DIR:-$_RLM_SCRIPT_DIR/../plugins}/${name}.md"
 		if [[ ! -f "$file" ]]; then
 			echo "rlm: warning: plugin '$name' not found at $file" >&2
 			continue
 		fi
+		local kind
+		kind=$(awk '/^---$/{fm++; next} fm==1 && /^kind:/{print $2; exit}' "$file")
 		local body
 		body=$(awk 'BEGIN{fm=0} /^---$/{if(fm<2){fm++;next}} fm>=2{print}' "$file")
-		if [[ -n "$plugin_bodies" ]]; then
-			plugin_bodies="${plugin_bodies}
+		if [[ "$kind" == "app" ]]; then
+			((app_count++)) || true
+			if [[ -n "$app_bodies" ]]; then
+				app_bodies="${app_bodies}
 
 ---
 
 ${body}"
+			else
+				app_bodies="$body"
+			fi
 		else
-			plugin_bodies="$body"
+			if [[ -n "$driver_bodies" ]]; then
+				driver_bodies="${driver_bodies}
+
+---
+
+${body}"
+			else
+				driver_bodies="$body"
+			fi
 		fi
 	done
+	if [[ "$app_count" -gt 1 ]]; then
+		echo "rlm: warning: multiple apps loaded; only one app per run is recommended" >&2
+	fi
+	# Drivers first, then apps — app task architecture wins in prompt positioning
+	local plugin_bodies=""
+	if [[ -n "$driver_bodies" && -n "$app_bodies" ]]; then
+		plugin_bodies="${driver_bodies}
+
+---
+
+${app_bodies}"
+	elif [[ -n "$driver_bodies" ]]; then
+		plugin_bodies="$driver_bodies"
+	else
+		plugin_bodies="$app_bodies"
+	fi
 	echo "$plugin_bodies"
 }
 
