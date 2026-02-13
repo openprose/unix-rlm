@@ -14,10 +14,11 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateSNIAHTasks } from "./datasets/s-niah.js";
 import { loadOolongTasks } from "./datasets/oolong.js";
+import { loadArcTasks } from "./datasets/arc.js";
 import { LocalDriver } from "./drivers/local.js";
 import { SshDriver } from "./drivers/ssh.js";
 import { runHarness } from "./harness.js";
-import { exactMatch, oolongScore } from "./scoring.js";
+import { exactMatch, oolongScore, arcGridMatch } from "./scoring.js";
 import type { Driver } from "./drivers/types.js";
 import type { EvalTask } from "./datasets/s-niah.js";
 
@@ -31,7 +32,7 @@ Usage:
   npx tsx src/run.ts --benchmark <benchmark> --model <model> [options]
 
 Required:
-  --benchmark       Benchmark to run: "s-niah" or "oolong"
+  --benchmark       Benchmark to run: "s-niah", "oolong", or "arc"
   --model           OpenRouter model identifier (e.g. "anthropic/claude-sonnet-4")
 
 Options:
@@ -44,6 +45,7 @@ Options:
   --tasks-per-length S-NIAH: tasks per context length (default: 8)
   --context-len     OOLONG: context length filter (default: 131072)
   --dataset-filter  OOLONG: dataset filter (default: trec_coarse)
+  --selected-problems ARC: comma-separated problem IDs to run (default: all)
   --output          Output file path (default: auto-generated)
   --help            Show this help message
 `.trim();
@@ -62,7 +64,7 @@ function formatTimestamp(): string {
 
 async function main(): Promise<void> {
   const args = minimist(process.argv.slice(2), {
-    string: ["benchmark", "model", "driver", "host", "output", "dataset-filter"],
+    string: ["benchmark", "model", "driver", "host", "output", "dataset-filter", "selected-problems"],
     default: {
       driver: "local",
       concurrency: 5,
@@ -105,9 +107,12 @@ async function main(): Promise<void> {
   const tasksPerLength = Number(args["tasks-per-length"]);
   const contextLen = Number(args["context-len"]);
   const datasetFilter = args["dataset-filter"];
+  const selectedProblems: string[] = args["selected-problems"]
+    ? args["selected-problems"].split(",").map((s: string) => s.trim())
+    : [];
 
-  if (benchmark !== "s-niah" && benchmark !== "oolong") {
-    console.error(`Error: unknown benchmark "${benchmark}". Use "s-niah" or "oolong".`);
+  if (benchmark !== "s-niah" && benchmark !== "oolong" && benchmark !== "arc") {
+    console.error(`Error: unknown benchmark "${benchmark}". Use "s-niah", "oolong", or "arc".`);
     process.exit(1);
   }
 
@@ -145,6 +150,15 @@ async function main(): Promise<void> {
     console.error(`Generating S-NIAH tasks (${tasksPerLength} per context length)...`);
     tasks = generateSNIAHTasks({ tasksPerLength });
     scoringFn = exactMatch;
+  } else if (benchmark === "arc") {
+    console.error(
+      `Loading ARC tasks${selectedProblems.length > 0 ? ` (selected: ${selectedProblems.join(", ")})` : ""}...`,
+    );
+    tasks = await loadArcTasks({
+      maxTasks: maxTasks,
+      selectedProblems: selectedProblems.length > 0 ? selectedProblems : undefined,
+    });
+    scoringFn = arcGridMatch;
   } else {
     console.error(`Loading OOLONG tasks (filter: ${datasetFilter}, context-len: ${contextLen})...`);
     tasks = await loadOolongTasks({
