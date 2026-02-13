@@ -149,16 +149,34 @@ teardown() {
     assert_output --partial "max iterations (3) reached without RETURN"
 }
 
-@test "Multiple code blocks per response: both blocks execute sequentially" {
+@test "Multiple code blocks per response: only first block executes (single-block mode)" {
     export _RLM_MOCK_DIR="$PROJECT_ROOT/test/fixtures/multi-block"
-    run "$RLM_BIN" "test query" < /dev/null
-    assert_success
+
+    # Capture stdout and stderr separately to avoid mixing them
+    local stdout_file="$TEST_TEMP/stdout.txt"
+    local stderr_file="$TEST_TEMP/stderr.txt"
+    _RLM_TREE_ROOT="$_RLM_TREE_ROOT" _RLM_MOCK_DIR="$_RLM_MOCK_DIR" \
+        "$RLM_BIN" "test query" > "$stdout_file" 2> "$stderr_file" < /dev/null
+    local exit_code=$?
+
+    assert [ "$exit_code" -eq 0 ]
+
+    # stdout should have the answer
+    run cat "$stdout_file"
     assert_output "multi-block-done"
+
+    # stderr should contain the single-block discard warning
+    run cat "$stderr_file"
+    assert_output --partial "discarding 1 additional code block(s) (single-block mode)"
 
     local workdir
     workdir="$(find_workdir)"
 
     assert_file_exist "$workdir/trace/001-output.txt"
+
+    # First iteration output (fed back to LLM) should contain the discard warning
+    run cat "$workdir/trace/001-output.txt"
+    assert_output --partial "extra code block(s) were discarded"
 }
 
 @test "RETURN stops remaining blocks: block 1 calls RETURN, block 2 does not execute" {
@@ -167,10 +185,22 @@ teardown() {
     # Clean up any leftover sentinel file
     rm -f /tmp/rlm-should-not-exist
 
-    run "$RLM_BIN" "test query" < /dev/null
-    assert_success
+    # Capture stdout and stderr separately (single-block discard warning goes to stderr)
+    local stdout_file="$TEST_TEMP/stdout-return.txt"
+    local stderr_file="$TEST_TEMP/stderr-return.txt"
+    _RLM_TREE_ROOT="$_RLM_TREE_ROOT" _RLM_MOCK_DIR="$_RLM_MOCK_DIR" \
+        "$RLM_BIN" "test query" > "$stdout_file" 2> "$stderr_file" < /dev/null
+    local exit_code=$?
+
+    assert [ "$exit_code" -eq 0 ]
+
+    run cat "$stdout_file"
     assert_output "stopped-early"
 
     # The second block should NOT have executed — it would have created this file
     assert [ ! -f /tmp/rlm-should-not-exist ]
+
+    # stderr should contain the single-block discard warning
+    run cat "$stderr_file"
+    assert_output --partial "discarding 1 additional code block(s) (single-block mode)"
 }

@@ -14,9 +14,11 @@ setup() {
     export RLM_ANSWER_FILE="$RLM_WORKDIR/answer"
     mkdir -p "$RLM_WORKDIR/trace" "$RLM_WORKDIR/children"
 
-    # Source extract_code_blocks and execute_block from the rlm script.
-    eval "$(awk '/^extract_code_blocks\(\)/{found=1; depth=0} found{print; if(/{/) depth++; if(/}/) depth--; if(found && depth==0 && /}/) exit}' "$RLM_BIN")"
-    eval "$(awk '/^execute_block\(\)/{found=1; depth=0} found{print; if(/{/) depth++; if(/}/) depth--; if(found && depth==0 && /}/) exit}' "$RLM_BIN")"
+    # Source extract_code_blocks and execute_block from the bash rlm script.
+    # These white-box tests extract bash functions directly; use the bash script regardless of RLM_BIN.
+    local bash_rlm="$PROJECT_ROOT/bin/rlm"
+    eval "$(awk '/^extract_code_blocks\(\)/{found=1; depth=0} found{print; if(/{/) depth++; if(/}/) depth--; if(found && depth==0 && /}/) exit}' "$bash_rlm")"
+    eval "$(awk '/^execute_block\(\)/{found=1; depth=0} found{print; if(/{/) depth++; if(/}/) depth--; if(found && depth==0 && /}/) exit}' "$bash_rlm")"
 }
 
 teardown() {
@@ -198,13 +200,35 @@ RETURN "quotes: '\''single'\'' and \"double\", backtick: \`, dollar: \$HOME, bac
     assert_file_exist "$workdir/trace/002-response.md"
 }
 
-@test "RETURN in second code block: two blocks in one response, RETURN in second" {
+@test "RETURN in second code block: single-block mode discards second block, RETURN in next iteration" {
     setup_e2e
     export _RLM_MOCK_DIR="$PROJECT_ROOT/test/fixtures/return-in-second-block"
 
-    run "$RLM_BIN" "test query" < /dev/null
-    assert_success
+    # Capture stdout and stderr separately (single-block discard warning goes to stderr)
+    local stdout_file="$TEST_TEMP/stdout-second-block.txt"
+    local stderr_file="$TEST_TEMP/stderr-second-block.txt"
+    _RLM_TREE_ROOT="$E2E_TREE_ROOT" _RLM_MOCK_DIR="$_RLM_MOCK_DIR" \
+        "$RLM_BIN" "test query" > "$stdout_file" 2> "$stderr_file" < /dev/null
+    local exit_code=$?
+
+    assert [ "$exit_code" -eq 0 ]
+
+    run cat "$stdout_file"
     assert_output "from-second-block"
+
+    # stderr should contain the single-block discard warning
+    run cat "$stderr_file"
+    assert_output --partial "discarding 1 additional code block(s) (single-block mode)"
+
+    local workdir
+    workdir="$(find_workdir "$E2E_TREE_ROOT")"
+
+    # First iteration output should contain the discard warning
+    run cat "$workdir/trace/001-output.txt"
+    assert_output --partial "extra code block(s) were discarded"
+
+    # Second iteration should have the actual RETURN
+    assert_file_exist "$workdir/trace/002-response.md"
 }
 
 @test "No implicit termination: response without RETURN continues the loop" {

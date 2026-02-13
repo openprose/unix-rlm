@@ -41,9 +41,23 @@ SYSTEM_PROMPT='IMPORTANT: Do NOT use function calling or tool use. Respond ONLY 
 
 You solve tasks by writing and executing code in a persistent Linux environment.
 
-Write code in ```repl fenced blocks. Every response MUST contain at least one ```repl block. Code outside ```repl fences is not executed.
+Write code in a single ```repl fenced block per response. Every response MUST contain at least one ```repl block. Code outside ```repl fences is not executed.
+
+**Only one code block per response is executed.** If you write more than one, only the first runs — the rest are silently discarded. Write your reasoning as plain text, then write exactly one code block, then stop. Wait for the output before planning your next step.
 
 When you have your final answer, call RETURN "value" inside a ```repl block. RETURN is the ONLY way to deliver your answer. Do not simply state the answer in prose.
+
+## How to Work
+
+Each iteration is one step. Do one thing, observe the result, then plan the next step.
+
+1. **Explore** — inspect the data. Use cat, head, wc, file, etc. If input is large, sample it.
+2. **Plan** — decide strategy. For large tasks, design a delegation structure.
+3. **Execute** — compute directly or delegate to children.
+4. **Verify** — print your candidate answer. Read the output to confirm.
+5. **Return** — only RETURN "answer" after you have seen the correct value printed.
+
+Your iterations are finite. Do not waste them — each one should make measurable progress. Do not narrate future steps or hypothesize about what output will look like. Write code, stop, read the actual output, and adapt.
 
 ## Delegation
 
@@ -70,7 +84,9 @@ write code, iterate, or delegate further.
 
 You have bash, python3, jq, curl, git, and all standard Unix tools. You can install more with apt or pip.
 
-Files persist across code blocks and across turns, but variables do not — each code block runs in a fresh shell. Use the filesystem for intermediate state.
+Files persist across turns, but variables do not — each code block runs in a fresh shell. Use the filesystem for intermediate state.
+
+Respond with plain text and exactly one ```repl fenced code block. Then stop and wait for the result.
 
 If input was piped to this invocation, it is saved at $RLM_INPUT. Process it programmatically — it may be larger than your context window.'
 
@@ -172,7 +188,7 @@ if [ -n "$_CHILD_SYSTEM_PROMPT" ]; then
 - Files persist across iterations. Use the filesystem for state.
 - If input was piped, it is at $RLM_INPUT.
 
-Write exactly one ```repl block per response.'
+Write exactly one ```repl fenced block per response. Only the first block is executed; additional blocks are discarded. Then stop and wait for the result.'
 
 	SYSTEM_PROMPT="${_CHILD_SYSTEM_PROMPT}${CHILD_REPL_SECTION}"
 fi
@@ -498,18 +514,34 @@ for ((iteration=_start_iteration; iteration<=RLM_EFFECTIVE_MAX_ITERS; iteration+
 	fi
 
 	consecutive_no_code=0
-	block_num=1
+
+	# Single-block enforcement: only execute the first code block.
+	# Count total blocks and warn if extras are discarded.
+	block_files=("$blocks_dir"/*.sh)
+	total_blocks=${#block_files[@]}
+
+	if [ "$total_blocks" -gt 1 ]; then
+		discarded=$((total_blocks - 1))
+		echo "rlm: discarding $discarded additional code block(s) (single-block mode)" >&2
+	fi
+
+	# Execute only the first block.
+	first_block="${block_files[0]}"
 	iteration_output=""
-	for block in "$blocks_dir"/*.sh; do
-		[ -f "$block" ] || break
+	if [ -f "$first_block" ]; then
+		output=$(execute_block "$first_block" "$iteration" 1)
 
-		output=$(execute_block "$block" "$iteration" "$block_num")
+		iteration_output="$output"
 
-		if [ -n "$iteration_output" ]; then
-			iteration_output="$iteration_output
-$output"
-		else
-			iteration_output="$output"
+		# Append discard warning to output so the LLM sees it in feedback.
+		if [ "$total_blocks" -gt 1 ]; then
+			discard_warning="[WARNING] $discarded extra code block(s) were discarded. Only the first block was executed. Write ONE code block per response and wait for real output before writing the next step."
+			if [ -n "$iteration_output" ]; then
+				iteration_output="$iteration_output
+$discard_warning"
+			else
+				iteration_output="$discard_warning"
+			fi
 		fi
 
 		if [ -f "$RLM_ANSWER_FILE" ]; then
@@ -519,9 +551,7 @@ $output"
 			emit_metadata "$iteration"
 			exit 0
 		fi
-
-		((block_num++))
-	done
+	fi
 
 	if [ -z "$iteration_output" ]; then
 		iteration_output="[No output. Your code ran successfully but produced no stdout/stderr. If you redirected to a file, read it back or use RETURN.]"
