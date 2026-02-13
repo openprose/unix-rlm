@@ -78,7 +78,7 @@ call_llm() {
 			-X POST \
 			-H "Content-Type: application/json" \
 			-H "Authorization: Bearer $OPENROUTER_API_KEY" \
-			--max-time 120 \
+			--max-time 240 \
 			--retry 0 \
 			"https://openrouter.ai/api/v1/chat/completions" \
 			-d "$request_body" 2>/dev/null) || {
